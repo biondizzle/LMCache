@@ -55,8 +55,14 @@ def _make_context(
             for _ in range(num_layers)
         ]
         fmt = lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-    manager = KVLayerGroupsManager(kv_caches, fmt, num_blocks=1, block_size=1)
+    manager = KVLayerGroupsManager(kv_caches, fmt, num_blocks=1)
     ctx.kv_layer_groups_manager_ = manager
+
+    # Compression metadata: every test group is non-compressed
+    # (compress_ratio=1), so physical slots per chunk == logical chunk_size.
+    num_groups = len(manager.kv_layer_groups)
+    ctx.group_compress_ratios_ = [1] * num_groups
+    ctx.group_lmcache_chunk_slots_ = [chunk_size] * num_groups
 
     # Build flat tmp_gpu_buffer_ with prefix-sum offsets (new layout)
     ctx.tmp_chunk_group_offsets_ = [0]
@@ -110,9 +116,14 @@ def _make_context_multi_group(
         kv_caches,
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         num_blocks=1,
-        block_size=1,
     )
     ctx.kv_layer_groups_manager_ = manager
+
+    # Compression metadata: every test group is non-compressed
+    # (compress_ratio=1), so physical slots per chunk == logical chunk_size.
+    num_groups = len(manager.kv_layer_groups)
+    ctx.group_compress_ratios_ = [1] * num_groups
+    ctx.group_lmcache_chunk_slots_ = [chunk_size] * num_groups
 
     # Build flat tmp_gpu_buffer_ with prefix-sum offsets
     ctx.tmp_chunk_group_offsets_ = [0]

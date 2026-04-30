@@ -54,10 +54,14 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - world_size: int - World size of the engine
         #   - engine_type: EngineType - Which serving engine produced the
         #     caches (vLLM, SGLang, ...). Drives format detection.
+        #   - vllm_block_size: int - vLLM-side block size (logical tokens per
+        #     vLLM block). Required so the server can correctly derive the
+        #     per-group compression ratio for compressed KV layer groups
+        #     (where ``shape_desc.bs < vllm_block_size``).
         #   - layout_hints: LayoutHints - See custom_types.LayoutHints.
         # Returns: None
         "REGISTER_KV_CACHE": ProtocolDefinition(
-            payload_classes=[int, KVCache, str, int, EngineType, LayoutHints],
+            payload_classes=[int, KVCache, str, int, EngineType, int, LayoutHints],
             response_class=None,
             handler_type=HandlerType.SYNC,
         ),

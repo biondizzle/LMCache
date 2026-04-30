@@ -36,6 +36,7 @@ def register_kv_cache_handler(
     model_name: str,
     world_size: int,
     engine_type: EngineType,
+    vllm_block_size: int,
     layout_hints: LayoutHints,
 ) -> None:
     """
@@ -47,6 +48,7 @@ def register_kv_cache_handler(
         model_name: Name of the model associated with this KV cache
         world_size: World size associated with this KV cache
         engine_type: Which serving engine produced the caches
+        vllm_block_size: vLLM-side block size (logical tokens per vLLM block)
         layout_hints: Engine-provided hints dict
 
     Returns:
@@ -66,6 +68,9 @@ def register_kv_cache_handler(
     )
     assert isinstance(engine_type, EngineType), (
         f"Expected engine_type to be EngineType, got {type(engine_type)}"
+    )
+    assert isinstance(vllm_block_size, int), (
+        f"Expected vllm_block_size to be int, got {type(vllm_block_size)}"
     )
     assert isinstance(layout_hints, dict), (
         f"Expected layout_hints to be dict, got {type(layout_hints)}"

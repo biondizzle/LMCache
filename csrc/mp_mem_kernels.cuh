@@ -15,6 +15,22 @@ struct PageBufferShapeDesc {
   int nh;            // num heads
   int hs;            // head size
   int element_size;  // bytes (1 or 2)
+  // Physical per-block stride in element units (= tensor.stride(0) of the
+  // representative layer). 0 means "unset — consumer must fall back to the
+  // format-specific tight stride". For vLLM KV pools where a group's row is
+  // padded up to the pool's max row width (e.g. DeepSeek V4 compressor /
+  // indexer caches sharing storage with larger attn groups), this value is
+  // strictly larger than the tight stride; the kernel MUST use it to avoid
+  // stepping into padding bytes.
+  //
+  // Only meaningful for formats whose dim-0 is the block axis:
+  //   - NL_X_NB_TWO_BS_NH_HS   (per-layer [NB, 2, BS, NH, HS])
+  //   - NL_X_NB_BS_HS          (per-layer [NB, BS, HS], MLA)
+  // For NB_NL_TWO_BS_NH_HS (single tensor, dim-0 packs all layers),
+  // NL_X_TWO_NB_BS_NH_HS (dim-0 is KV), and the SGL formats (dim-0 is the
+  // token row NBBS), per-block padding at dim-0 does not exist and the
+  // field is ignored.
+  int block_stride_elems;
 
   template <typename ScalarType>
   __host__ __device__ inline size_t scalars_per_head() const {
@@ -29,6 +45,21 @@ struct PageBufferShapeDesc {
   template <typename ScalarType>
   __host__ __device__ inline size_t scalars_per_block() const {
     return bs * nh * hs * element_size / sizeof(ScalarType);
+  }
+
+  // Per-block stride in ScalarType units, for formats whose dim-0 is the
+  // block axis. ``tight`` is the format-specific fallback when
+  // ``block_stride_elems`` is 0 (untouched by caller / legacy path).
+  template <typename ScalarType>
+  __host__ __device__ inline size_t block_stride_or(
+      size_t tight_in_scalar_type) const {
+    if (block_stride_elems <= 0) {
+      return tight_in_scalar_type;
+    }
+    // block_stride_elems counts elements of the source KV dtype
+    // (element_size bytes each); convert to ScalarType units.
+    return static_cast<size_t>(block_stride_elems) * element_size /
+           sizeof(ScalarType);
   }
 };
 
