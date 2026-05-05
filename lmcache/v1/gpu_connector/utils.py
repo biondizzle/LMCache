@@ -94,11 +94,21 @@ def attempt_permute_to_contiguous_view(
     ``[2, NB, BS, NH, HS]`` via a dim permute. Sorting dims by stride
     undoes the permute without touching storage.
 
-    Raises:
-        ValueError: If a tensor leaf is non-contiguous for a reason
-            other than dim permutation (e.g. slicing, ``as_strided``).
-            We refuse to fall back to ``.contiguous()`` (which would
-            copy) so the caller's invariant is never silently violated.
+    For tensors that remain non-contiguous even after dim-permute
+    recovery (e.g. vLLM unified KV pool views where dim-0 has an
+    inflated periodic stride because every block slot is padded to a
+    model-wide maximum), this function returns the tensor unchanged.
+    Rationale: :class:`CudaIPCWrapper` transports ``(shape, stride,
+    storage_offset)`` verbatim and the receiver rebuilds the view via
+    ``torch.Tensor.set_(storage, offset, shape, stride)``, which
+    supports arbitrary strided views (including periodic-dim-0 and
+    ``as_strided``-produced layouts) and yields a bit-identical view.
+    Downstream consumers that rely on ``shape`` alone to infer the
+    physical layout must therefore also consult ``stride``.
+
+    We deliberately never fall back to ``.contiguous()`` (which would
+    allocate and copy), so the caller's zero-copy invariant is
+    preserved.
     """
     if isinstance(kv_caches, torch.Tensor):
         if kv_caches.is_contiguous():
@@ -106,11 +116,93 @@ def attempt_permute_to_contiguous_view(
         strides = kv_caches.stride()
         perm = sorted(range(kv_caches.ndim), key=lambda i: strides[i], reverse=True)
         result = kv_caches.permute(perm)
-        if not result.is_contiguous():
+        if result.is_contiguous():
+            return result
+        # Non-permute non-contiguity. Only a very constrained pattern is
+        # compatible with downstream kernels:
+        #   - ``stride[-1] == 1`` and ``stride[-2] == shape[-1]`` (i.e. each
+        #     "block row" is internally tightly packed), AND
+        #   - only the block dim (dim-0) has structural padding, expressed
+        #     as ``stride[0] >= prod(shape[1:])`` with all interior dims
+        #     satisfying ``stride[i] == prod(shape[i+1:])``.
+        # This matches vLLM's per-group KV pool padding, where each group's
+        # physical block row is aligned to the pool's maximum row width
+        # (e.g. DeepSeek V4 compressor / indexer caches). Downstream
+        # transfer kernels treat such padding via
+        # ``PageBufferShapeDesc.block_stride_elems``; see
+        # ``make_page_buffer_shape_desc``.
+        #
+        # Any other non-contiguity (interior-dim padding, negative strides,
+        # storage_offset != 0, overlapping views, etc.) is NOT recoverable
+        # downstream and must fail loudly — silently passing through would
+        # cause kernels to read garbage from the wrong block offsets.
+        #
+        # IMPORTANT: validate against ``result`` (the stride-sorted
+        # permuted view), not ``kv_caches``. For tensors that are both
+        # permuted (e.g. vLLM HND physical layout exposed as NHD logical
+        # shape) and dim-0-padded, the original's inner-dim strides are
+        # unsorted and would falsely trip the ``stride[-2] == shape[-1]``
+        # tight-packing check. After stride-sorting by ``permute``, the
+        # inner dims of ``result`` are guaranteed to be in descending
+        # stride order, so only dim-0 (outermost) can legitimately carry
+        # padding. ``permute`` shares storage and preserves
+        # ``storage_offset`` / ``numel`` / ``storage_nbytes``, so those
+        # checks are equivalent on either view.
+        shape = tuple(result.shape)
+        stride = tuple(result.stride())
+        ndim = result.ndim
+        storage_offset = int(result.storage_offset())
+
+        def _fail(reason: str) -> None:
             raise ValueError(
-                "tensor is non-contiguous for reasons other than permutation "
-                "(e.g. slicing or as_strided). Cannot recover contiguous view."
+                "attempt_permute_to_contiguous_view: tensor is non-contiguous "
+                f"and not a supported (dim-0 padding only) layout — {reason}. "
+                f"shape={shape}, stride={stride}, "
+                f"storage_offset={storage_offset}, numel={int(result.numel())}, "
+                f"storage_nbytes={int(result.untyped_storage().nbytes())}, "
+                f"dtype={result.dtype}. "
+                "Downstream KV transfer kernels only understand dim-0 "
+                "block-row padding; other strided views would produce "
+                "wrong reads/writes and are rejected."
             )
+
+        if ndim < 2:
+            _fail("ndim < 2")
+        if stride[-1] != 1:
+            _fail("stride[-1] != 1 (inner dim not contiguous)")
+        if stride[-2] != shape[-1]:
+            _fail("stride[-2] != shape[-1] (last-two dims not tightly packed)")
+        if storage_offset != 0:
+            _fail("storage_offset != 0 (slice/narrow view, base address shifted)")
+        # Interior dims (1 .. ndim-2 exclusive) must be tightly packed with
+        # respect to the dims to their right. Only dim-0's stride is
+        # allowed to exceed the tight value.
+        inner_tight = 1
+        for i in range(ndim - 1, 0, -1):
+            if i < ndim - 1 and stride[i] != inner_tight:
+                _fail(
+                    f"dim {i} stride {stride[i]} != tight {inner_tight} "
+                    "(interior-dim padding is not supported)"
+                )
+            inner_tight *= shape[i]
+        # Now ``inner_tight == prod(shape[1:])``; dim-0 must be >= that.
+        if stride[0] < inner_tight:
+            _fail(
+                f"dim-0 stride {stride[0]} < prod(shape[1:])={inner_tight} "
+                "(overlapping blocks)"
+            )
+        padding_per_block = stride[0] - inner_tight
+        logger.debug(
+            "attempt_permute_to_contiguous_view: accepting dim-0-padded "
+            "view; downstream kernels must honour block_stride_elems. "
+            "shape=%s, stride=%s, padding_per_block_elems=%d, "
+            "storage_nbytes=%s, dtype=%s",
+            shape,
+            stride,
+            padding_per_block,
+            int(result.untyped_storage().nbytes()),
+            result.dtype,
+        )
         return result
     return [attempt_permute_to_contiguous_view(sub) for sub in kv_caches]
 
@@ -527,10 +619,17 @@ def get_num_blocks(
 
 
 def get_block_size(
-    kv_caches: DiscoverableKVCache, gpu_kv_format: "lmc_ops.GPUKVFormat"
+    kv_caches: DiscoverableKVCache,
+    gpu_kv_format: "lmc_ops.GPUKVFormat",
+    layer_idx: int = 0,
 ) -> int:
-    """
-    Get the block size from the kv_caches
+    """Return the block size (tokens per block) for layer ``layer_idx``.
+
+    ``layer_idx`` is honoured only for per-layer formats where BS may
+    differ across layers (e.g. mixed-compression MLA pools). For
+    cross-layer formats BS is shared across layers and ``layer_idx``
+    is ignored. Raises ``ValueError`` for NBBS-fused formats, which
+    have no separate BS dim.
     """
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         return kv_caches.shape[3]
@@ -542,15 +641,15 @@ def get_block_size(
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
     ):
         # NHD: [..., BS, NH, HS] — block_size at shape[2]
-        return kv_caches[0].shape[2]
+        return kv_caches[layer_idx].shape[2]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
         # HND: [..., NH, BS, HS] — block_size at shape[3]
-        return kv_caches[0].shape[3]
+        return kv_caches[layer_idx].shape[3]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
-        return kv_caches[0].shape[1]
+        return kv_caches[layer_idx].shape[1]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS:
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=gpu_kv_format))
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
@@ -943,10 +1042,34 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
     Descends into any list nesting until a tensor is found; assumes all
     tensors in *kv_caches* live on the same device (true for every
     current :class:`GPUKVFormat`).
+
+    Raises:
+        ValueError: If *kv_caches* (or any nested list along the descent
+            path) is empty, or if a non-tensor / non-list leaf is
+            encountered. The exception message records the index path
+            taken so the caller can pinpoint where the structure went
+            wrong (e.g. all layers filtered out by the adapter's skip
+            list, producing a top-level empty list).
     """
     probe: DiscoverableKVCache = kv_caches
+    path: list[int] = []
     while isinstance(probe, list):
+        if len(probe) == 0:
+            raise ValueError(
+                "get_device: empty KV cache list encountered at path "
+                f"{path or 'root'}. This typically means every layer was "
+                "dropped upstream (e.g. the vLLM adapter's transfer-skip "
+                "filter matched all layer names). Ensure at least one "
+                "layer survives filtering before calling GPUCacheContext."
+            )
+        path.append(0)
         probe = probe[0]
+    if not isinstance(probe, torch.Tensor):
+        raise ValueError(
+            "get_device: descent reached a non-tensor leaf of type "
+            f"{type(probe).__name__} at path {path}; expected a "
+            "torch.Tensor. KV cache structure is malformed."
+        )
     return probe.device
 
 
@@ -957,6 +1080,7 @@ def make_page_buffer_shape_desc(
     num_layers_in_group: int,
     num_blocks: int,
     block_size: int,
+    block_stride_elems: Optional[int] = None,
 ) -> "lmc_ops.PageBufferShapeDesc":
     """Build a :class:`PageBufferShapeDesc` from a representative layer.
 
@@ -967,6 +1091,15 @@ def make_page_buffer_shape_desc(
         num_layers_in_group: Number of layers in the group (``nl``).
         num_blocks: Number of paged blocks (``nb``).
         block_size: Tokens per block (``bs``).
+        block_stride_elems: Physical per-block stride in *elements*
+            (= ``tensor.stride(0)`` of the representative layer). If
+            ``None``, defaults to the tight stride derived from
+            ``block_size``, ``num_heads``, ``head_size``, and
+            ``kv_size``. Pass the real value whenever the group's KV
+            pool may be dim-0-padded (e.g. DeepSeek V4
+            compressor/indexer caches sharing a row width with a
+            larger group in the same pool); otherwise downstream
+            transfer kernels will skip into padding and corrupt data.
 
     Returns:
         A populated ``PageBufferShapeDesc``.
@@ -983,6 +1116,38 @@ def make_page_buffer_shape_desc(
     )
     desc.hs = get_head_size(kv_caches, gpu_kv_format, layer_idx)
     desc.element_size = get_dtype(kv_caches, gpu_kv_format, layer_idx).itemsize
+
+    # "Tight" per-block stride used by legacy kernels:
+    #   non-MLA: bs * kv_size * nh * hs   (K and V stored within one block row)
+    #   MLA:     bs * nh * hs             (single tensor, nh forced to 1)
+    # For most (contiguous) layouts this equals ``tensor.stride(0)``; for
+    # dim-0-padded pools (vLLM mixed-compression groups) the real stride
+    # is larger.
+    tight = desc.bs * desc.nh * desc.hs * (1 if is_mla(gpu_kv_format) else desc.kv_size)
+    resolved_stride = int(block_stride_elems) if block_stride_elems else tight
+    if block_stride_elems is not None and resolved_stride < tight:
+        raise ValueError(
+            "make_page_buffer_shape_desc: block_stride_elems="
+            f"{block_stride_elems} is smaller than the tight stride {tight} "
+            f"(bs={desc.bs}, kv_size={desc.kv_size}, nh={desc.nh}, "
+            f"hs={desc.hs}); this would cause overlapping block reads."
+        )
+    # ``block_stride_elems`` is a new field; older compiled C++ extensions
+    # won't expose it. Set it best-effort and continue — kernels that
+    # don't know about the field will fall back to the tight stride.
+    try:
+        desc.block_stride_elems = resolved_stride
+    except AttributeError:
+        if resolved_stride != tight:
+            # This is a real correctness hazard: we have a padded layout
+            # but the kernel can't be told about it.
+            raise ValueError(
+                "lmc_ops.PageBufferShapeDesc has no 'block_stride_elems' "
+                "attribute (old compiled extension) but a padded layout "
+                f"was detected (stride={resolved_stride}, tight={tight}). "
+                "Rebuild the C++ extension with the updated ABI before "
+                "using dim-0-padded KV pools."
+            ) from None
     return desc
 
 

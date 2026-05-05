@@ -746,6 +746,7 @@ def registered_instance(
             "testmodel",
             1,
             EngineType.VLLM,
+            16,
             {},
         ],
         get_response_class(RequestType.REGISTER_KV_CACHE),

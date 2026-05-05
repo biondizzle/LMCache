@@ -385,7 +385,7 @@ def test_mq_register_kv_cache():
     # Run test with REGISTER_KV_CACHE request
     helper.run_test(
         request_type=RequestType.REGISTER_KV_CACHE,
-        payloads=[gpu_id, kv_cache, "testmodel", 1, EngineType.VLLM, {}],
+        payloads=[gpu_id, kv_cache, "testmodel", 1, EngineType.VLLM, 16, {}],
         expected_response=None,
         num_requests=1,
     )

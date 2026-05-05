@@ -39,16 +39,29 @@ __device__ inline size_t calculate_engine_global_offset(
            k_or_v * shape_desc.nb * scalars_per_block;
   } else if constexpr (format == GPUKVFormat::NL_X_NB_TWO_BS_NH_HS) {
     // Flash Infer: L tensors [NB, 2, BS, NH, HS]
-    return engine_block_idx * shape_desc.kv_size * scalars_per_block +
-           k_or_v * scalars_per_block;
+    // dim-0 is the block axis → honour block_stride_elems if the caller
+    // populated it (needed for dim-0-padded vLLM KV pools where the
+    // group's row is padded up to the pool's max row width, e.g.
+    // DeepSeek V4 compressor / indexer caches). Fallback to the tight
+    // stride ``kv_size * scalars_per_block`` preserves legacy behaviour
+    // for untouched callers.
+    const size_t tight_block_stride = shape_desc.kv_size * scalars_per_block;
+    const size_t per_block =
+        shape_desc.block_stride_or<ScalarType>(tight_block_stride);
+    return engine_block_idx * per_block + k_or_v * scalars_per_block;
   } else if constexpr (format == GPUKVFormat::NL_X_NB_BS_HS) {
     // MLA: L tensors [NB, BS, HS]
-    return engine_block_idx * scalars_per_block;
+    // dim-0 is the block axis → honour block_stride_elems (see note above).
+    const size_t per_block =
+        shape_desc.block_stride_or<ScalarType>(scalars_per_block);
+    return engine_block_idx * per_block;
   } else if constexpr (format == GPUKVFormat::TWO_X_NL_X_NBBS_NH_HS) {
-    // SGLang MHA: 2L tensors [NBBS, NH, HS] — K/V via separate tensor ptrs
+    // SGLang MHA: 2L tensors [NBBS, NH, HS] — K/V via separate tensor ptrs.
+    // dim-0 is the token row (NBBS), not a block; per-block dim-0 padding
+    // is not meaningful here — ignore block_stride_elems.
     return engine_block_idx * scalars_per_block;
   } else if constexpr (format == GPUKVFormat::NL_X_NBBS_ONE_HS) {
-    // SGLang MLA: L tensors [NBBS, 1, HS]
+    // SGLang MLA: L tensors [NBBS, 1, HS] — same reasoning as above.
     return engine_block_idx * scalars_per_block;
   } else if constexpr (format == GPUKVFormat::NB_NL_TWO_NH_BS_HS) {
     // TRT-LLM cross-layer HND: single tensor [NB, NL, 2, NH, BS, HS]

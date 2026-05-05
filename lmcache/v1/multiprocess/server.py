@@ -110,22 +110,37 @@ def compute_extra_count(
 
 
 def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayoutDesc:
-    """Get the memory layout description for a given GPU context and number of tokens.
+    """Get the memory layout description for a given GPU context and number of
+    *logical* tokens.
 
     Supports multiple KV layer groups with different shapes and dtypes.
+    For a compressed group, ``num_tokens`` logical tokens occupy only
+    ``num_tokens // compress_ratio`` physical slots, so the shape passed
+    to the MemoryObj must be sized in *physical* slots (otherwise the
+    MemoryObj would be ``compress_ratio`` times larger than the bytes
+    actually produced by the D2H kernel, and the H2D scatter would
+    consume only a prefix of the MemoryObj on retrieve).
 
     Args:
         gpu_context: The GPU cache context containing the KV cache information.
-        num_tokens: The number of tokens to determine the layout for.
+        num_tokens: The number of *logical* tokens (vLLM-facing) to
+            determine the layout for. For the chunk path this is
+            ``self.chunk_size``.
 
     Returns:
         MemoryLayoutDesc: The memory layout description containing shapes and dtypes.
     """
     num_groups = gpu_context.kv_layer_groups_manager.num_groups
-    shapes = [
-        gpu_context.get_kv_buffer_shape(num_tokens, group_idx)
-        for group_idx in range(num_groups)
-    ]
+    shapes = []
+    for group_idx in range(num_groups):
+        compress_ratio = gpu_context.get_group_compress_ratio(group_idx)
+        if num_tokens % compress_ratio != 0:
+            raise ValueError(
+                f"num_tokens ({num_tokens}) is not a multiple of "
+                f"compress_ratio ({compress_ratio}) for group {group_idx}"
+            )
+        group_num_slots = num_tokens // compress_ratio
+        shapes.append(gpu_context.get_kv_buffer_shape(group_num_slots, group_idx))
     dtypes = [
         gpu_context.kv_layer_groups_manager.kv_layer_groups[group_idx].dtype
         for group_idx in range(num_groups)
@@ -219,6 +234,7 @@ class MPCacheEngine:
         model_name: str,
         world_size: int,
         engine_type: EngineType,
+        vllm_block_size: int,
         layout_hints: LayoutHints,
     ) -> None:
         """
@@ -232,21 +248,28 @@ class MPCacheEngine:
             world_size (int): The world size associated with this KV cache.
             engine_type: Which serving engine produced the caches.
                 Forwarded to :class:`GPUCacheContext` for format detection.
+            vllm_block_size (int): The vLLM-side block size (logical tokens
+                per vLLM block). Required so that ``GPUCacheContext`` can
+                correctly derive per-group compression ratios when some
+                KV layer groups compress multiple logical tokens into a
+                single physical slot (``shape_desc.bs < vllm_block_size``).
             layout_hints: See :class:`LayoutHints`.  Forwarded to
                 :class:`GPUCacheContext` for GPU KV format detection.
         """
         gpu_context = GPUCacheContext(
             kv_caches,
             self.chunk_size,
+            vllm_block_size=vllm_block_size,
             layout_hints=layout_hints or None,
             engine_type=engine_type,
         )
         self.gpu_contexts[instance_id] = gpu_context
         self.gpu_context_meta[instance_id] = (model_name, world_size)
         logger.info(
-            "Registered KV cache for GPU ID %d with %d layers",
+            "Registered KV cache for GPU ID %d with %d layers (vllm_block_size=%d)",
             instance_id,
             gpu_context.num_layers,
+            vllm_block_size,
         )
 
     def unregister_kv_cache(self, instance_id: int) -> None:
@@ -304,7 +327,12 @@ class MPCacheEngine:
         gpu_context = self.gpu_contexts[instance_id]
         model_name = self.gpu_context_meta[instance_id][0]
 
-        blocks_per_chunk = self.chunk_size // gpu_context.block_size
+        # ``blocks_per_chunk`` is counted in vLLM-side blocks (each block
+        # addresses ``vllm_block_size`` *logical* tokens). For compressed
+        # groups the per-group physical slot count differs, but the
+        # block-id indexing is shared with vLLM and therefore uses the
+        # vLLM block size here.
+        blocks_per_chunk = self.chunk_size // gpu_context.vllm_block_size
 
         with (
             torch.cuda.device(gpu_context.device),
@@ -371,6 +399,14 @@ class MPCacheEngine:
                     for group_idx in range(num_groups):
                         tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
                         group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                        # Kernel contract: ``lmcache_chunk_size`` here is the
+                        # number of *physical* slots per chunk for this group
+                        # (= logical chunk_size // compress_ratio). It must
+                        # satisfy ``num_blocks_per_object * shape_desc.bs ==
+                        # lmcache_chunk_size`` inside the kernel.
+                        group_lmcache_chunk_slots = (
+                            gpu_context.get_group_lmcache_chunk_slots(group_idx)
+                        )
                         lmc_ops.multi_layer_block_kv_transfer(
                             group_kv_pointers,
                             [tmp_buffer.data_ptr()],
@@ -378,7 +414,7 @@ class MPCacheEngine:
                             gpu_context.device,
                             lmc_ops.TransferDirection.D2H,
                             gpu_context.get_shape_desc(group_idx),
-                            self.chunk_size,
+                            group_lmcache_chunk_slots,
                             gpu_context.gpu_kv_format_,
                             0,
                         )
@@ -495,7 +531,7 @@ class MPCacheEngine:
             ),
         )
 
-        blocks_per_chunk = self.chunk_size // gpu_context.block_size
+        blocks_per_chunk = self.chunk_size // gpu_context.vllm_block_size
 
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             _BATCH_SIZE = gpu_context.max_batch_size
@@ -519,16 +555,21 @@ class MPCacheEngine:
                         self.chunk_size * batch_len - 1,
                     ),
                 )
-                if skip_tokens_in_chunk % gpu_context.block_size != 0:
+                # ``skip_*_in_chunk`` is expressed in vLLM-block units (logical
+                # tokens), which is what the kernel's ``skip_blocks_in_chunk``
+                # argument expects regardless of per-group compression.
+                vllm_block_size = gpu_context.vllm_block_size
+                if skip_tokens_in_chunk % vllm_block_size != 0:
                     logger.error(
-                        "skip_first_n_tokens (%d) is not aligned to block_size (%d), "
+                        "skip_first_n_tokens (%d) is not aligned to "
+                        "vllm_block_size (%d), "
                         "rounding down from %d tokens to %d blocks",
                         skip_first_n_tokens,
-                        gpu_context.block_size,
+                        vllm_block_size,
                         skip_tokens_in_chunk,
-                        skip_tokens_in_chunk // gpu_context.block_size,
+                        skip_tokens_in_chunk // vllm_block_size,
                     )
-                skip_blocks_in_chunk = skip_tokens_in_chunk // gpu_context.block_size
+                skip_blocks_in_chunk = skip_tokens_in_chunk // vllm_block_size
 
                 start_chunk_id = batch_idx * _BATCH_SIZE
                 end_chunk_id = start_chunk_id + batch_len
@@ -548,6 +589,9 @@ class MPCacheEngine:
                         batch_len, group_idx
                     )
                     group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                    group_lmcache_chunk_slots = (
+                        gpu_context.get_group_lmcache_chunk_slots(group_idx)
+                    )
 
                     lmc_ops.multi_layer_block_kv_transfer(
                         group_kv_pointers,
@@ -556,7 +600,7 @@ class MPCacheEngine:
                         gpu_context.device,
                         lmc_ops.TransferDirection.H2D,
                         gpu_context.get_shape_desc(group_idx),
-                        self.chunk_size,
+                        group_lmcache_chunk_slots,
                         gpu_context.gpu_kv_format_,
                         skip_blocks_in_chunk,
                     )
@@ -932,12 +976,19 @@ class MPCacheEngine:
             )
         )
         if session is None:
-            logger.warning("Session %s not found, skipping touch", request_id)
+            # Normal: request ended without ever creating a session
+            # (e.g. preempted before first lookup, or end_session arrives
+            # twice due to retry). Not an error.
+            logger.debug("Session %s not found, skipping touch", request_id)
             return
         if session.lookup_ipc_key is None:
-            logger.warning(
-                "Session %s has no lookup ipc key, skipping touch", request_id
-            )
+            # Normal: the request's ``lookup()`` RPC took an early-return
+            # branch before it could stamp ``lookup_ipc_key`` on the
+            # session. Typical triggers:
+            #   - prompt shorter than ``chunk_size`` → empty chunk_hashes;
+            #   - model/world_size mismatch (layout_desc is None).
+            # There is nothing to touch in L1 in any of these cases.
+            logger.debug("Session %s has no lookup ipc key, skipping touch", request_id)
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
@@ -962,7 +1013,14 @@ class MPCacheEngine:
             if ctx is not None:
                 entry["kv_cache_layout"] = {
                     "num_layers": ctx.num_layers,
-                    "block_size": ctx.block_size,
+                    # ``vllm_block_size`` is the scalar "logical tokens per
+                    # vLLM block" addressing unit. ``group_block_sizes`` is
+                    # the per-KV-layer-group physical slot count; for
+                    # compressed groups it is smaller than
+                    # ``vllm_block_size`` by ``group_compress_ratios``.
+                    "vllm_block_size": ctx.vllm_block_size,
+                    "group_block_sizes": ctx.group_block_sizes,
+                    "group_compress_ratios": ctx.group_compress_ratios,
                     "hidden_dim_sizes": str(ctx.hidden_dim_sizes),
                     "dtype": str(ctx.dtype),
                     "is_mla": ctx.is_mla,

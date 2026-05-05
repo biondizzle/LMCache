@@ -28,12 +28,14 @@ try:
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
+        ParallelStrategy,
     )
 except ImportError:
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration import (
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
+        ParallelStrategy,
     )
 
 if TYPE_CHECKING:
@@ -100,6 +102,28 @@ def extract_world_size_and_kv_rank(
         return world_size // tp_size, rank // tp_size
 
 
+def _build_parallel_strategy(vllm_config: VllmConfig) -> ParallelStrategy:
+    """Construct a ParallelStrategy describing the current worker's parallel
+    layout (including MLA-aware kv world size / kv rank).
+    """
+    actual_world_size = vllm_config.parallel_config.world_size
+    actual_worker_id = vllm_config.parallel_config.rank
+    kv_world_size, kv_worker_id = extract_world_size_and_kv_rank(
+        actual_world_size,
+        actual_worker_id,
+        vllm_config,
+    )
+    return ParallelStrategy(
+        use_mla=mla_enabled(vllm_config.model_config),
+        kv_world_size=kv_world_size,
+        kv_worker_id=kv_worker_id,
+        actual_world_size=actual_world_size,
+        actual_worker_id=actual_worker_id,
+        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+        pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+    )
+
+
 def create_scheduler_adapter(
     server_url: str,
     zmq_context: zmq.Context,
@@ -107,29 +131,16 @@ def create_scheduler_adapter(
     mq_timeout: float,
     heartbeat_interval: float,
 ) -> LMCacheMPSchedulerAdapter:
-    world_size, kv_rank = extract_world_size_and_kv_rank(
-        vllm_config.parallel_config.world_size,
-        vllm_config.parallel_config.rank,
-        vllm_config,
-    )
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
-
-    # Pass tp_size only when the adapter accepts it so that
-    # a newer vllm can still work with an older LMCache.
-    kwargs: dict[str, Any] = {}
-    if _adapter_accepts_tp_size():
-        kwargs["tp_size"] = tp_size
+    parallel_strategy = _build_parallel_strategy(vllm_config)
 
     return LMCacheMPSchedulerAdapter(
-        server_url,
-        zmq_context,
-        vllm_config.model_config.model,
-        world_size,
-        kv_rank,
-        vllm_config.cache_config.block_size,
+        server_url=server_url,
+        context=zmq_context,
+        model_name=vllm_config.model_config.model,
+        vllm_block_size=vllm_config.cache_config.block_size,
+        parallel_strategy=parallel_strategy,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
-        **kwargs,
     )
 
 
@@ -140,18 +151,14 @@ def create_worker_adapter(
     mq_timeout: float,
     heartbeat_interval: float,
 ) -> LMCacheMPWorkerAdapter:
-    world_size, kv_rank = extract_world_size_and_kv_rank(
-        vllm_config.parallel_config.world_size,
-        vllm_config.parallel_config.rank,
-        vllm_config,
-    )
+    parallel_strategy = _build_parallel_strategy(vllm_config)
+
     return LMCacheMPWorkerAdapter(
-        server_url,
-        zmq_context,
-        vllm_config.model_config.model,
-        world_size,
-        kv_rank,
-        vllm_config.cache_config.block_size,
+        server_url=server_url,
+        context=zmq_context,
+        model_name=vllm_config.model_config.model,
+        vllm_block_size=vllm_config.cache_config.block_size,
+        parallel_strategy=parallel_strategy,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
     )
@@ -439,7 +446,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         return self.__str__()
 
 
-class LMCacheMPConnector(KVConnectorBase_V1):
+class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
     """
     The connector for LMCache multi-process mode.
 
