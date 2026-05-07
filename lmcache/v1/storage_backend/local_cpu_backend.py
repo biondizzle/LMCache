@@ -804,12 +804,23 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         if not evict_keys:
                             break
 
+                # #1939: evict proportionally to the required allocation size
+                # instead of 1 candidate per retry. This reduces warning spam
+                # from O(required_size / avg_entry_size) retries to O(1).
+                freed_bytes = 0
+                with self.cpu_lock:
+                    while freed_bytes < target_bytes:
+                        evict_keys = self.cache_policy.get_evict_candidates(
+                            self.hot_cache, num_candidates=1
+                        )
+                        if not evict_keys:
+                            break
+
                         # HACK: We assume batch_size=num_layers here.
                         # FIXME: We also assume if the one layer's ref_count
                         # > 1 or pinned, then the other layers are also
                         # ref_count > 1 or pinned in the cpu memory.
                         # This might not be true.
-                        evict_keys_count += len(evict_keys)
                         for evict_key in evict_keys:
                             evict_key_all_layer = evict_key.split_layers(
                                 batch_size
@@ -820,14 +831,24 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             # like usage tracking is not supported.
                             old_mem_objs = []
                             for key in evict_key_all_layer:
-                                mem_obj = self.hot_cache[key]
+                                old_mem_obj = self.hot_cache.get(key)
+                                if old_mem_obj is None or not old_mem_obj.can_evict:
+                                    old_mem_objs = []
+                                    break
+                                mem_obj = old_mem_obj
                                 meta = mem_obj.metadata
                                 freed_bytes += (
                                     meta.phy_size
                                     if meta.phy_size > 0
                                     else meta.get_size()
                                 )
-                                old_mem_objs.append(mem_obj)
+                                old_mem_objs.append(old_mem_obj)
+
+                            if not old_mem_objs:
+                                continue
+
+                            evict_keys_count += len(old_mem_objs)
+                            for key in evict_key_all_layer:
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
 
@@ -843,6 +864,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             alloc_bytes / (1024 * 1024),
                         )
                     else:
+                        self.stats_monitor.update_local_cpu_evict_failed_count(
+                            1
+                        )
                         self.stats_monitor.update_local_cpu_evict_failed_count(
                             1
                         )
@@ -868,7 +892,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             memory_objs = self.memory_allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt
             )
-            if memory_objs:
+            if memory_objs is not None:
                 break
 
             num_attempts += 1
