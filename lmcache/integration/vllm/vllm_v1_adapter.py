@@ -911,14 +911,16 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
                 if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "Request %s"
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!",
+                    # Partial retrieval — some tokens that the lookup server promised
+                    # are not actually available in cache (evicted between lookup and
+                    # retrieve, CPU allocation failure, ZMQ timeout, etc.).
+                    # This is a normal cache miss path, not an error. vLLM will call
+                    # get_block_ids_with_load_errors() and _handle_invalid_blocks to
+                    # recompute the missing tokens.
+                    logger.debug(
+                        "Request %s partial retrieval: got %d/%d tokens "
+                        "(treating missing as cache miss, will recompute)",
                         request.req_id,
-                    )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
                         num_retrieved_tokens,
                         num_expected_tokens,
                     )
