@@ -36,6 +36,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Maximum retries for CPU allocation before giving up.
+# 50 attempts × 0.1s sleep = 5s max worker block time,
+# well under vLLM's RPC timeout (~30s).
+MAX_ALLOC_ATTEMPTS = 50
+
 
 class LocalCPUBackend(AllocatorBackendInterface):
     """
@@ -662,33 +667,55 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if memory_obj is not None or not eviction:
             return memory_obj
 
+        # Compute allocation size for proportional eviction.
+        if isinstance(shapes, list):
+            alloc_bytes = get_size_bytes(shapes, dtypes)
+        else:
+            alloc_bytes = shapes.numel() * dtypes.itemsize
+        # Target: free 2x the required size to account for fragmentation,
+        # with a 32 MiB floor to cover alignment overhead.
+        target_bytes = max(alloc_bytes * 2, 32 * 1024 * 1024)
+
         evict_keys_count = 0
         num_attempts = 0
         while True:
             # whether or not this request needs to wait or other requests
             wait_other_requests = True
             if self.use_hot:
-                # TODO(Jiayi): optimize `num_candidates` with estimation.
-                # Accurate estimation is hard due to fragmentation
-                num_candidates = 1
-                evict_keys = None
+                # Evict proportionally to the required allocation size
+                # instead of 1 candidate per retry. This reduces warning spam
+                # from O(required_size / avg_entry_size) retries to O(1).
+                freed_bytes = 0
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
-                    if evict_keys:
+                    while freed_bytes < target_bytes:
+                        evict_keys = self.cache_policy.get_evict_candidates(
+                            self.hot_cache, num_candidates=1
+                        )
+                        if not evict_keys:
+                            break
+                        for key in evict_keys:
+                            if key in self.hot_cache:
+                                meta = self.hot_cache[key].metadata
+                                freed_bytes += (
+                                    meta.phy_size
+                                    if meta.phy_size > 0
+                                    else get_size_bytes(
+                                        meta.shape, meta.dtype
+                                    )
+                                )
                         # we can continue trying to evict from the hot_cache
                         # and don't need to wait for other requests yet
                         wait_other_requests = False
                         logger.debug(
-                            "Evicting %d chunks from cpu memory", len(evict_keys)
+                            "Evicting %d chunks from cpu memory (freed %d bytes, target %d)",
+                            len(evict_keys), freed_bytes, target_bytes,
                         )
                         # remove
                         self.batched_remove(evict_keys, force=False)
                         evict_keys_count += len(evict_keys)
-                    else:
+                    if not evict_keys and freed_bytes == 0:
                         self.stats_monitor.update_local_cpu_evict_failed_count(
-                            num_candidates
+                            1
                         )
 
             if wait_other_requests:
@@ -715,6 +742,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 break
 
             num_attempts += 1
+            if num_attempts >= MAX_ALLOC_ATTEMPTS:
+                logger.error(
+                    "CPU allocation failed after %d attempts. "
+                    "Giving up to prevent worker stall — "
+                    "this store will be skipped (graceful cache miss).",
+                    num_attempts,
+                )
+                self.stats_monitor.update_local_cpu_evict_metrics(
+                    evict_keys_count
+                )
+                return None
             logger.debug(
                 "Unable to allocate memory object after %d"
                 " attempts of local cpu backend allocate()",
@@ -853,6 +891,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 break
 
             num_attempts += 1
+            if num_attempts >= MAX_ALLOC_ATTEMPTS:
+                logger.error(
+                    "CPU allocation failed after %d attempts. "
+                    "Giving up to prevent worker stall — "
+                    "this store will be skipped (graceful cache miss).",
+                    num_attempts,
+                )
+                self.stats_monitor.update_local_cpu_evict_metrics(
+                    evict_keys_count
+                )
+                return None
             logger.debug(
                 "Unable to allocate memory object after %d"
                 " attempts of local cpu backend batched_allocate()",
