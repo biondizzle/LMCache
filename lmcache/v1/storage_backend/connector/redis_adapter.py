@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 import os
 
 # First Party
@@ -61,8 +61,7 @@ class RESPConnectorAdapter(ConnectorAdapter):
             else int(os.environ.get("LMCACHE_RESP_PORT", "0"))
         )
 
-        # Optional TTL (seconds) for remote KV cache keys; None = no expiry
-        self.remote_ttl = config.remote_ttl if config else None
+        remote_ttl = context.config.remote_ttl if context.config else None
 
         logger.info("Creating RESP connector for %s:%d", host, port)
         return RESPConnector(
@@ -73,7 +72,7 @@ class RESPConnectorAdapter(ConnectorAdapter):
             num_threads=self.resp_num_threads,
             username=username,
             password=password,
-            remote_ttl=self.remote_ttl,
+            remote_ttl=remote_ttl,
         )
 
 
@@ -84,18 +83,33 @@ class RedisConnectorAdapter(ConnectorAdapter):
         super().__init__("redis://")
 
     def can_parse(self, url: str) -> bool:
-        return url.startswith((self.schema, "rediss://", "unix://"))
+        return url.startswith((self.schema, "rediss://", "unix://", "plugin://redis"))
 
     def create_connector(self, context: ConnectorContext) -> RemoteConnector:
         # Local
         from .redis_connector import RedisConnector
 
-        config = context.config
-        remote_ttl = config.remote_ttl if config else None
+        url = context.url
+        if url.startswith("plugin://redis"):
+            extra_config: Dict[str, Any] = {}
+            remote_url = None
+            if context.config is not None:
+                extra_config = (
+                    context.config.extra_config
+                    if context.config.extra_config is not None
+                    else {}
+                )
+                remote_url = context.config.remote_url
+            cfg_redis_url = extra_config.get(
+                "remote_storage_plugin.redis.redis_url"
+            ) or extra_config.get("redis_url")
+            url = cfg_redis_url or remote_url or "redis://localhost:6379"
 
-        logger.info(f"Creating Redis connector for URL: {context.url}")
+        remote_ttl = context.config.remote_ttl if context.config else None
+
+        logger.info(f"Creating Redis connector for URL: {url}")
         return RedisConnector(
-            url=context.url,
+            url=url,
             loop=context.loop,
             local_cpu_backend=context.local_cpu_backend,
             remote_ttl=remote_ttl,
@@ -112,11 +126,10 @@ class RedisSentinelConnectorAdapter(ConnectorAdapter):
         # Local
         from .redis_connector import RedisSentinelConnector
 
-        config = context.config
-        remote_ttl = config.remote_ttl if (config and hasattr(config, "remote_ttl")) else None
+        remote_ttl = context.config.remote_ttl if (context.config and hasattr(context.config, 'remote_ttl')) else None
 
         logger.info(f"Creating Redis Sentinel connector for URL: {context.url}")
-        url = context.url.removeprefix(self.schema) if self.schema else context.url
+        url = context.url[len(self.schema) :]
 
         # Parse username and password
         username: str = ""
@@ -161,8 +174,7 @@ class RedisClusterConnectorAdapter(ConnectorAdapter):
         # Local
         from .redis_connector import RedisClusterConnector
 
-        config = context.config
-        remote_ttl = config.remote_ttl if (config and hasattr(config, "remote_ttl")) else None
+        remote_ttl = context.config.remote_ttl if (context.config and hasattr(context.config, 'remote_ttl')) else None
 
         logger.info(f"Creating Redis Cluster connector for URL: {context.url}")
         url = context.url[len(self.schema) :]

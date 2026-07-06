@@ -1,6 +1,11 @@
 Redis
 =====
 
+.. warning::
+
+   This page documents the behavior of LMCache's in-process mode (deprecated). Please consider using :doc:`LMCache MP mode </mp/index>` for better feature support and performance. For the MP mode equivalent of this page, see :doc:`/mp/l2_storage/resp`.
+
+
 .. _redis-overview:
 
 Overview
@@ -29,9 +34,6 @@ Two ways to configure LMCache Redis Offloading:
     # How to serialize and deserialize KV cache on remote transmission
     export LMCACHE_REMOTE_SERDE="naive" # "naive" (default) or "cachegen"
 
-    # TTL in seconds for remote KV cache keys (Redis/RESP only, null = no expiry)
-    # export LMCACHE_REMOTE_TTL="3600"
-
 **2. Configuration File**:
 
 Passed in through ``LMCACHE_CONFIG_FILE=your-lmcache-config.yaml``
@@ -52,8 +54,20 @@ Example ``config.yaml``:
     # How to serialize and deserialize KV cache on remote transmission
     remote_serde: "naive" # "naive" (default) or "cachegen"
 
-    # TTL in seconds for remote KV cache keys (Redis/RESP only, null = no expiry)
-    # remote_ttl: 3600
+Dynamic Plugin Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: yaml
+
+    # 256 Tokens per KV Chunk
+    chunk_size: 256
+    local_cpu: true
+
+    remote_storage_plugins:
+      - "redis"
+
+    extra_config:
+      remote_storage_plugin.redis.redis_url: "redis://your-redis-host:6379"
 
 Remote Storage Explanation:
 ----------------------------

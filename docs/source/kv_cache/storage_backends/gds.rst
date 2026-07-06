@@ -1,6 +1,11 @@
 GDS Backend
 ==================
 
+.. warning::
+
+   This page documents the behavior of LMCache's in-process mode (deprecated). Please consider using :doc:`LMCache MP mode </mp/index>` for better feature support and performance. For the MP mode equivalent of this page, see :doc:`/mp/l2_storage/index`.
+
+
 .. _gds-overview:
 
 Overview
@@ -123,7 +128,7 @@ Using AMD hipFile
 
    hipFile is alpha software and has been tested on limited hardware.
    For full installation details, see the
-   `hipFile install guide <https://github.com/ROCm/hipFile/blob/develop/INSTALL.md>`__.
+   `hipFile install guide <https://github.com/ROCm/rocm-systems/blob/develop/projects/hipfile/INSTALL.md>`__.
 
 **Prerequisites:**
 

@@ -35,10 +35,11 @@ modules:
 
 | Module | Endpoint | Method | Description |
 |---|---|---|---|
-| `root_api.py` | `/` | GET | Basic liveness check |
-| `healthcheck_api.py` | `/api/healthcheck` | GET | K8s probe endpoint |
-| `cache_api.py` | `/api/clear-cache` | POST | Force-clear L1 cache |
-| `status_api.py` | `/api/status` | GET | Internal status report |
+| `info_api.py` | `/` | GET | Basic liveness check |
+| `info_api.py` | `/healthcheck` | GET | K8s probe endpoint |
+| `info_api.py` | `/status` | GET | Internal status report |
+| `config_api.py` | `/config` | GET | Server config dump |
+| `cache_api.py` | `/cache/clear` | POST | Force-clear L1 cache |
 
 ### `http_server.py`
 
@@ -70,10 +71,10 @@ HTTPAPIRegistry(app)
 register_all_apis()
   │
   ├─ pkgutil.iter_modules("http_apis/")
-  │    ├─ root_api       → has router? ✓ → include
-  │    ├─ healthcheck_api → has router? ✓ → include
+  │    ├─ info_api        → has router? ✓ → include
+  │    ├─ config_api      → has router? ✓ → include
   │    ├─ cache_api       → has router? ✓ → include
-  │    ├─ status_api      → has router? ✓ → include
+  │    ├─ quota_api       → has router? ✓ → include
   │    └─ my_new_api      → has router? ✓ → include
   │
   └─ app.include_router(collected_router)
@@ -100,7 +101,7 @@ from fastapi.responses import JSONResponse
 router = APIRouter()
 
 
-@router.get("/api/metrics")
+@router.get("/metrics")
 async def metrics(request: Request):
     """Return cache hit/miss metrics."""
     engine = getattr(request.app.state, "engine", None)
@@ -158,7 +159,7 @@ server lifecycle and all endpoint handlers. Available attributes
 Access these via the `Request` object in your handler:
 
 ```python
-@router.get("/api/my-endpoint")
+@router.get("/my-endpoint")
 async def my_endpoint(request: Request):
     engine = request.app.state.engine
     # ... use engine ...

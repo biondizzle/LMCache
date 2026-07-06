@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import zmq
+from lmcache import torch_dev, torch_device_type
 from lmcache.integration.vllm.utils import mla_enabled
-from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.utils import check_interprocess_event_support, init_logger as lmcache_init_logger
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -28,14 +29,12 @@ try:
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
-        ParallelStrategy,
     )
 except ImportError:
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration import (
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
-        ParallelStrategy,
     )
 
 if TYPE_CHECKING:
@@ -102,28 +101,6 @@ def extract_world_size_and_kv_rank(
         return world_size // tp_size, rank // tp_size
 
 
-def _build_parallel_strategy(vllm_config: VllmConfig) -> ParallelStrategy:
-    """Construct a ParallelStrategy describing the current worker's parallel
-    layout (including MLA-aware kv world size / kv rank).
-    """
-    actual_world_size = vllm_config.parallel_config.world_size
-    actual_worker_id = vllm_config.parallel_config.rank
-    kv_world_size, kv_worker_id = extract_world_size_and_kv_rank(
-        actual_world_size,
-        actual_worker_id,
-        vllm_config,
-    )
-    return ParallelStrategy(
-        use_mla=mla_enabled(vllm_config.model_config),
-        kv_world_size=kv_world_size,
-        kv_worker_id=kv_worker_id,
-        actual_world_size=actual_world_size,
-        actual_worker_id=actual_worker_id,
-        tp_size=vllm_config.parallel_config.tensor_parallel_size,
-        pp_size=vllm_config.parallel_config.pipeline_parallel_size,
-    )
-
-
 def create_scheduler_adapter(
     server_url: str,
     zmq_context: zmq.Context,
@@ -131,16 +108,29 @@ def create_scheduler_adapter(
     mq_timeout: float,
     heartbeat_interval: float,
 ) -> LMCacheMPSchedulerAdapter:
-    parallel_strategy = _build_parallel_strategy(vllm_config)
+    world_size, kv_rank = extract_world_size_and_kv_rank(
+        vllm_config.parallel_config.world_size,
+        vllm_config.parallel_config.rank,
+        vllm_config,
+    )
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    # Pass tp_size only when the adapter accepts it so that
+    # a newer vllm can still work with an older LMCache.
+    kwargs: dict[str, Any] = {}
+    if _adapter_accepts_tp_size():
+        kwargs["tp_size"] = tp_size
 
     return LMCacheMPSchedulerAdapter(
-        server_url=server_url,
-        context=zmq_context,
-        model_name=vllm_config.model_config.model,
-        vllm_block_size=vllm_config.cache_config.block_size,
-        parallel_strategy=parallel_strategy,
+        server_url,
+        zmq_context,
+        vllm_config.model_config.model,
+        world_size,
+        kv_rank,
+        vllm_config.cache_config.block_size,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
+        **kwargs,
     )
 
 
@@ -151,16 +141,22 @@ def create_worker_adapter(
     mq_timeout: float,
     heartbeat_interval: float,
 ) -> LMCacheMPWorkerAdapter:
-    parallel_strategy = _build_parallel_strategy(vllm_config)
-
+    world_size, kv_rank = extract_world_size_and_kv_rank(
+        vllm_config.parallel_config.world_size,
+        vllm_config.parallel_config.rank,
+        vllm_config,
+    )
+    extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
     return LMCacheMPWorkerAdapter(
-        server_url=server_url,
-        context=zmq_context,
-        model_name=vllm_config.model_config.model,
-        vllm_block_size=vllm_config.cache_config.block_size,
-        parallel_strategy=parallel_strategy,
+        server_url,
+        zmq_context,
+        vllm_config.model_config.model,
+        world_size,
+        kv_rank,
+        vllm_config.cache_config.block_size,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
+        extra_config=extra_config,
     )
 
 
@@ -437,7 +433,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
             request_strs.append(
                 f"RequestMetadata(request_id={req_meta.request_id}, "
                 f"direction={req_meta.direction}, "
-                f"num_blocks={len(req_meta.op)}, "
+                f"num_blocks={len(req_meta.op.flat_block_ids)}, "
                 f"block_ids={req_meta.op.block_ids})"
             )
         return "[" + "\n".join(request_strs) + "]"
@@ -446,7 +442,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         return self.__str__()
 
 
-class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
+class LMCacheMPConnector(KVConnectorBase_V1):
     """
     The connector for LMCache multi-process mode.
 
@@ -456,6 +452,11 @@ class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
     - lmcache.mp.mq_timeout: timeout (seconds) for message queue requests.
     - lmcache.mp.heartbeat_interval: interval (seconds) between server
       heartbeat pings.
+    - lmcache.mp.mp_transfer_mode: routing mode for the worker -> server
+      transfer context. One of ``auto`` (default; CUDA -> engine_driven,
+      others -> lmcache_driven), ``engine_driven`` (force IPC / SHM
+      zero-copy), ``lmcache_driven`` (force worker-side gather/scatter
+      copy). Overrides the ``LMCACHE_MP_TRANSFER_MODE`` env var when set.
     """
 
     def __init__(
@@ -465,6 +466,9 @@ class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
         kv_cache_config: "KVCacheConfig | None" = None,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+
+        # fast-fail if interprocess is not supported
+        check_interprocess_event_support()
 
         assert vllm_config.kv_transfer_config is not None
         server_host = vllm_config.kv_transfer_config.get_from_extra_config(
@@ -566,8 +570,9 @@ class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
         if len(request_ids) == 0:
             return
 
-        with torch.cuda.stream(torch.cuda.current_stream()):
-            event = torch.cuda.Event(interprocess=True)
+        with torch_dev.stream(torch_dev.current_stream()):
+            # Not all backends support interprocess Events (CUDA IPC specific)
+            event = torch_dev.Event(interprocess=True)
             event.record()
 
         self.worker_adapter.batched_submit_retrieve_requests(request_ids, ops, event)
@@ -628,8 +633,9 @@ class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
         if len(request_ids) == 0:
             return
 
-        with torch.cuda.stream(torch.cuda.current_stream()):
-            event = torch.cuda.Event(interprocess=True)
+        with torch_dev.stream(torch_dev.current_stream()):
+            # Not all backends support interprocess Events (CUDA IPC specific)
+            event = torch_dev.Event(interprocess=True)
             event.record()
 
         self.worker_adapter.batched_submit_store_requests(request_ids, ops, event)

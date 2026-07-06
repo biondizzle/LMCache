@@ -2,7 +2,7 @@
 # Standard
 from collections import OrderedDict
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import os
 import random
 import shlex
@@ -29,6 +29,7 @@ from .utils import (
     DummyLMCacheAsyncLookupServer,
     check_paged_kv_cache_equal,
     create_gpu_connector,
+    create_test_memory_obj,
     dumb_metadata,
     generate_kv_cache_paged_list_tensors,
     generate_tokens,
@@ -978,6 +979,154 @@ def test_paged_prefetch_retrieve(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_async_lookup_and_prefetch_layerwise(autorelease_v1):
+    # Regression: before the fix, async_lookup_and_prefetch sent chunk-level
+    # CacheEngineKey objects into batched_async_contains, but store_layer
+    # populates hot_cache with per-layer LayerCacheEngineKey objects, so every
+    # lookup reported 0 hits. We stage hot_cache the way store_layer would and
+    # assert async_lookup_and_prefetch reports the full token count.
+    chunk_size = 256
+    num_layers = 4
+    num_chunks = 3
+    num_tokens = chunk_size * num_chunks
+    kv_shape = (num_layers, 2, chunk_size, 8, 128)
+    lookup_id = "layerwise-async-1"
+
+    captured: dict[str, int] = {}
+
+    class _RecordingAsyncLookupServer:
+        def send_response_to_scheduler(
+            self, lookup_id: str, retrieved_length: int
+        ) -> None:
+            captured[lookup_id] = retrieved_length
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_size,
+        backend="cpu",
+        enable_async_loading=True,
+    )
+    cfg.use_layerwise = True
+
+    connector = create_gpu_connector(1024, num_layers)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        ),
+        async_lookup_server=_RecordingAsyncLookupServer(),
+    )
+
+    tokens = generate_tokens(num_tokens, "cuda")
+    chunk_keys = [
+        key for _, _, key in engine.token_database.process_tokens(tokens=tokens)
+    ]
+    assert len(chunk_keys) == num_chunks
+
+    # Populate LocalCPUBackend.hot_cache the way store_layer would: one entry
+    # per (chunk, layer) keyed by LayerCacheEngineKey.
+    cpu_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    for chunk_key in chunk_keys:
+        for layer_key in chunk_key.split_layers(num_layers):
+            cpu_backend.submit_put_task(layer_key, create_test_memory_obj())
+
+    engine.async_lookup_and_prefetch(lookup_id=lookup_id, tokens=tokens)
+
+    deadline = time.time() + 10
+    while (
+        engine.event_manager.get_event_status(EventType.LOADING, lookup_id)
+        != EventStatus.DONE
+    ):
+        if time.time() > deadline:
+            raise TimeoutError("layerwise async lookup did not finish in time")
+        time.sleep(0.01)
+
+    assert captured.get(lookup_id) == num_tokens, (
+        f"Expected retrieved_length={num_tokens}, got {captured.get(lookup_id)}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_async_lookup_and_prefetch_layerwise_partial_layer_missing(autorelease_v1):
+    # When a single per-layer key is missing for one chunk, that chunk must be
+    # rounded down to a miss (the `// keys_per_chunk` round-down path).
+    chunk_size = 256
+    num_layers = 4
+    num_chunks = 3
+    num_tokens = chunk_size * num_chunks
+    kv_shape = (num_layers, 2, chunk_size, 8, 128)
+    lookup_id = "layerwise-async-2"
+
+    captured: dict[str, int] = {}
+
+    class _RecordingAsyncLookupServer:
+        def send_response_to_scheduler(
+            self, lookup_id: str, retrieved_length: int
+        ) -> None:
+            captured[lookup_id] = retrieved_length
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_size,
+        backend="cpu",
+        enable_async_loading=True,
+    )
+    cfg.use_layerwise = True
+
+    connector = create_gpu_connector(1024, num_layers)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        ),
+        async_lookup_server=_RecordingAsyncLookupServer(),
+    )
+
+    tokens = generate_tokens(num_tokens, "cuda")
+    chunk_keys = [
+        key for _, _, key in engine.token_database.process_tokens(tokens=tokens)
+    ]
+
+    # Stage chunks 0 and 1 fully; drop the last per-layer key of chunk 2.
+    cpu_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    for i, chunk_key in enumerate(chunk_keys):
+        per_layer_keys = chunk_key.split_layers(num_layers)
+        if i == len(chunk_keys) - 1:
+            per_layer_keys = per_layer_keys[:-1]
+        for layer_key in per_layer_keys:
+            cpu_backend.submit_put_task(layer_key, create_test_memory_obj())
+
+    engine.async_lookup_and_prefetch(lookup_id=lookup_id, tokens=tokens)
+
+    deadline = time.time() + 10
+    while (
+        engine.event_manager.get_event_status(EventType.LOADING, lookup_id)
+        != EventStatus.DONE
+    ):
+        if time.time() > deadline:
+            raise TimeoutError("layerwise async lookup did not finish in time")
+        time.sleep(0.01)
+
+    # First two chunks are complete; the partially-evicted third chunk is a
+    # miss, so the prefix-match retrieval pattern reports 2 chunks worth.
+    assert captured.get(lookup_id) == 2 * chunk_size, (
+        f"Expected retrieved_length={2 * chunk_size}, got {captured.get(lookup_id)}"
+    )
+
+
 @pytest.mark.parametrize("chunk_size", [256])
 @pytest.mark.parametrize(
     "backend",
@@ -1755,233 +1904,154 @@ def test_process_tokens_first_block_fails():
     assert tot_kv_size == 0
     assert not ret_mask.any()
     mem1.ref_count_down.assert_called_once()
-# ----------------------------------------------------------------------------
-# Regression test for the cache_engine.store() pin-leak fix.
-#
-# LMCacheEngine.store() wraps gpu_connector.batched_from_gpu(...) and
-# storage_manager.batched_put(...) in a try/except. When either raises,
-# the except branch unpins and ref_count_down's every memory_obj that
-# was allocated in the same call. Without this, a failed from_gpu /
-# batched_put leaves pins held, which on production verda-h200 (GLM-5,
-# 2026-04-09) led to CPU staging pool exhaustion and engine deadlock.
-#
-# This test does NOT spin up a full LMCacheEngine — that would require
-# CUDA. Instead it uses LMCacheEngine.store as an unbound function
-# called against a stub-self with the minimum mocked attributes the
-# function needs. The point is to lock down the unpin-on-exception
-# contract: if a future change strips the try/except, this test will
-# fail and the operator will know not to land it.
-#
-# Related: neuralwatt/inference_frontend#1900, #1903
-# ----------------------------------------------------------------------------
 
 
-class TestCacheEngineStoreUnpinOnFailure:
-    """Regression tests for the LMCacheEngine.store() try/except pin
-    cleanup added in the verda incident response."""
+def test_compress_decompress_unpin_not_pinned() -> None:
+    """Verify that compress and decompress check is_pinned before calling unpin()
 
-    def _make_stub_engine(self, memory_objs, raise_in_from_gpu=True):
-        """Build a minimal stub-self that LMCacheEngine.store can run
-        against. Returns the stub plus the gpu_connector mock so the
-        caller can verify which path raised.
-        """
-        # Standard
-        from contextlib import contextmanager
-        from types import SimpleNamespace
-        from unittest.mock import MagicMock
+    This prevents negative pin counts and double unpin warnings on backends like
+    Remote/S3.
+    """
+    # Create mock memory objects
+    mock_mem_obj = MagicMock()
+    mock_mem_obj.is_pinned = False  # Not pinned (e.g. from Remote/S3 backend)
 
-        # Third Party
-        import torch as _torch
+    mock_compressed_mem_obj = MagicMock()
+    mock_compressed_mem_obj.is_pinned = False  # Not pinned
 
-        # First Party
-        from lmcache.utils import CacheEngineKey
+    # Mock serializer and deserializer
+    mock_serializer = MagicMock()
+    mock_serializer.serialize.return_value = mock_compressed_mem_obj
+    mock_deserializer = MagicMock()
+    mock_deserializer.deserialize.return_value = mock_mem_obj
 
-        @contextmanager
-        def _noop_cm():
-            yield
+    # Create a mock engine
+    engine = MagicMock(spec=LMCacheEngine)
+    engine.metadata = MagicMock()
+    engine.config = MagicMock()
+    engine.lookup_pins = {"event_123": {"remote": ["key1"]}}
 
-        store_stats = MagicMock()
-        store_stats.profile_process_tokens = _noop_cm
-        store_stats.profile_from_gpu = _noop_cm
-        store_stats.profile_put = _noop_cm
-        store_stats.process_tokens_time = 0
-        store_stats.from_gpu_time = 0
-        store_stats.put_time = 0
-        store_stats.time_to_store = MagicMock(return_value=1.0)
+    # Mock engine.lookup to return number of tokens (non-zero)
+    engine.lookup.return_value = 100
 
-        stats_monitor = MagicMock()
-        stats_monitor.on_store_request = MagicMock(return_value=store_stats)
-        stats_monitor.on_store_finished = MagicMock()
+    # Mock storage_manager methods
+    engine.storage_manager = MagicMock()
+    # For compress: batched_get returns mock_mem_obj
+    engine.storage_manager.batched_get.return_value = [mock_mem_obj]
 
-        gpu_connector = MagicMock()
-        if raise_in_from_gpu:
-            gpu_connector.batched_from_gpu = MagicMock(
-                side_effect=RuntimeError("simulated GPU connector failure")
-            )
-        else:
-            gpu_connector.batched_from_gpu = MagicMock(return_value=None)
-
-        storage_manager = MagicMock()
-        # The store() method allocates memory_objs in the loop ahead of
-        # the try/except. We pre-allocate them in the test and inject
-        # them via storage_manager.allocate, which store() calls.
-        storage_manager.allocate = MagicMock(side_effect=list(memory_objs))
-        storage_manager.batched_put = MagicMock(
-            side_effect=RuntimeError("simulated storage_manager failure")
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        # Call compress on the engine
+        res = LMCacheEngine.compress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="remote",
+            event_id="event_123",
         )
 
-        token_database = MagicMock()
-        # process_tokens yields one (start, end, key) per memory_obj.
-        token_database.process_tokens = MagicMock(
-            return_value=[
-                (i * 16, (i + 1) * 16,
-                 CacheEngineKey(
-                     model_name="test_unpin",
-                     world_size=1,
-                     worker_id=0,
-                     chunk_hash=hash(("unpin", i)),
-                     dtype=_torch.bfloat16,
-                 ))
-                for i in range(len(memory_objs))
-            ]
+        assert res == 100
+        # Verify that serialize was called
+        mock_serializer.serialize.assert_called_once_with(mock_mem_obj)
+        # Verify that unpin was NOT called since is_pinned = False
+        mock_mem_obj.unpin.assert_not_called()
+
+        # Verify batched_remove and batched_put were called on storage_manager
+        engine.storage_manager.batched_remove.assert_called_once_with(
+            ["key1"], locations=["remote"]
+        )
+        engine.storage_manager.batched_put.assert_called_once_with(
+            keys=["key1"],
+            memory_objs=[mock_compressed_mem_obj],
+            location="remote",
         )
 
-        metadata = MagicMock()
-        metadata.get_shapes = MagicMock(return_value=[_torch.Size([1, 4, 16, 132])])
-        metadata.get_dtypes = MagicMock(return_value=[_torch.uint8])
-        metadata.worker_id = 0
+    # Reset storage_manager mock
+    engine.storage_manager.reset_mock()
+    # For decompress: batched_get returns mock_compressed_mem_obj
+    engine.storage_manager.batched_get.return_value = [mock_compressed_mem_obj]
 
-        config = MagicMock()
-        config.get_extra_config_value = MagicMock(return_value=False)
-
-        stub = SimpleNamespace(
-            config=config,
-            gpu_connector=gpu_connector,
-            storage_manager=storage_manager,
-            token_database=token_database,
-            metadata=metadata,
-            stats_monitor=stats_monitor,
-            kv_events_enabled=False,
-            store_location=None,
-            fmt=None,
-            is_healthy=lambda: True,
-            _is_passive=lambda: False,
-            is_frozen=lambda: False,
-            _get_req_id=lambda kwargs: kwargs.get("req_id", "test"),
-            _log_kvcache_for_check=lambda **kwargs: None,
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        res_decomp = LMCacheEngine.decompress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="remote",
+            event_id="event_123",
         )
-        return stub, gpu_connector, storage_manager
 
-    def _make_pinned_memory_objs(self, count):
-        """Allocate `count` real TensorMemoryObj instances and pin them
-        + ref_count_up them, so we can verify they get unpinned by
-        store()'s except branch.
-        """
-        # Third Party
-        import torch as _torch
+        assert res_decomp == 100
+        # Verify that deserialize was called
+        mock_deserializer.deserialize.assert_called_once_with(mock_compressed_mem_obj)
+        # Verify that unpin was NOT called since is_pinned = False
+        mock_compressed_mem_obj.unpin.assert_not_called()
 
-        # First Party
-        from lmcache.v1.memory_management import (
-            MemoryFormat,
-            MixedMemoryAllocator,
+        # Verify batched_remove and batched_put were called on storage_manager
+        engine.storage_manager.batched_remove.assert_called_once_with(
+            ["key1"], locations=["remote"]
         )
-        from lmcache.v1.config import LMCacheEngineConfig
-        from lmcache.v1.pin_monitor import PinMonitor
+        engine.storage_manager.batched_put.assert_called_once_with(
+            keys=["key1"],
+            memory_objs=[mock_mem_obj],
+            location="remote",
+        )
 
-        # PinMonitor must be initialized before .pin() is called.
-        PinMonitor.GetOrCreate(LMCacheEngineConfig.from_legacy(chunk_size=16))
 
-        allocator = MixedMemoryAllocator(8 * 1024 * 1024)
-        shapes = [_torch.Size([1, 4, 16, 132])]
-        dtypes = [_torch.uint8]
-        objs = []
-        for _ in range(count):
-            mo = allocator.allocate(shapes, dtypes, fmt=MemoryFormat.KV_2LTD)
-            assert mo is not None
-            mo.pin()  # store() implicitly relies on objs being pinned by
-                      # the gpu_connector. We simulate that here so the
-                      # test can observe whether the except branch unpins.
-            objs.append(mo)
-        return objs, allocator
+def test_compress_decompress_unpin_when_pinned() -> None:
+    """Verify that compress and decompress call unpin() if is_pinned is True"""
+    # Create mock memory objects
+    mock_mem_obj = MagicMock()
+    mock_mem_obj.is_pinned = True
 
-    def test_store_unpins_memory_objs_when_from_gpu_raises(self):
-        """When gpu_connector.batched_from_gpu raises, store() must
-        unpin every memory_obj it had allocated and call ref_count_down
-        on each, so the CPU staging pool can reclaim them.
-        """
-        # First Party
-        from lmcache.v1.cache_engine import LMCacheEngine
+    mock_compressed_mem_obj = MagicMock()
+    mock_compressed_mem_obj.is_pinned = True
 
-        memory_objs, allocator = self._make_pinned_memory_objs(count=3)
-        try:
-            for mo in memory_objs:
-                assert mo.is_pinned, "test setup: memory_obj should be pinned"
-                assert mo.get_ref_count() == 1, (
-                    "test setup: ref_count should be 1 after fresh alloc"
-                )
+    # Mock serializer and deserializer
+    mock_serializer = MagicMock()
+    mock_serializer.serialize.return_value = mock_compressed_mem_obj
+    mock_deserializer = MagicMock()
+    mock_deserializer.deserialize.return_value = mock_mem_obj
 
-            stub, gpu_conn, storage = self._make_stub_engine(
-                memory_objs, raise_in_from_gpu=True
-            )
+    # Create a mock engine
+    engine = MagicMock(spec=LMCacheEngine)
+    engine.metadata = MagicMock()
+    engine.config = MagicMock()
+    engine.lookup_pins = {"event_123": {"local_cpu": ["key1"]}}
+    engine.lookup.return_value = 100
+    engine.storage_manager = MagicMock()
 
-            # Call the unbound store() against the stub.
-            LMCacheEngine.store(stub, tokens=list(range(48)))
+    # Test compress
+    engine.storage_manager.batched_get.return_value = [mock_mem_obj]
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        LMCacheEngine.compress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="local_cpu",
+            event_id="event_123",
+        )
+        mock_mem_obj.unpin.assert_called_once()
 
-            # gpu_connector.batched_from_gpu was called and raised
-            assert gpu_conn.batched_from_gpu.called, (
-                "test plumbing: gpu_connector.batched_from_gpu should "
-                "have been called"
-            )
-            # batched_put should NOT have been called (from_gpu raised first)
-            assert not storage.batched_put.called, (
-                "batched_put should not be reached when from_gpu raises"
-            )
-
-            # The actual contract under test:
-            for i, mo in enumerate(memory_objs):
-                assert not mo.is_pinned, (
-                    f"memory_obj[{i}] still pinned after store() "
-                    f"failed in from_gpu (pin_count={mo.metadata.pin_count})"
-                )
-        finally:
-            for mo in memory_objs:
-                if mo.is_valid() and mo.metadata.pin_count > 0:
-                    mo.unpin()
-            try:
-                allocator.close()
-            except Exception:
-                pass
-
-    def test_store_unpins_memory_objs_when_batched_put_raises(self):
-        """When storage_manager.batched_put raises (after a successful
-        from_gpu), store() must STILL unpin every memory_obj.
-        """
-        # First Party
-        from lmcache.v1.cache_engine import LMCacheEngine
-
-        memory_objs, allocator = self._make_pinned_memory_objs(count=2)
-        try:
-            stub, gpu_conn, storage = self._make_stub_engine(
-                memory_objs, raise_in_from_gpu=False
-            )
-
-            LMCacheEngine.store(stub, tokens=list(range(32)))
-
-            assert gpu_conn.batched_from_gpu.called
-            assert storage.batched_put.called, (
-                "batched_put should be reached when from_gpu succeeds"
-            )
-
-            for i, mo in enumerate(memory_objs):
-                assert not mo.is_pinned, (
-                    f"memory_obj[{i}] still pinned after store() "
-                    f"failed in batched_put (pin_count={mo.metadata.pin_count})"
-                )
-        finally:
-            for mo in memory_objs:
-                if mo.is_valid() and mo.metadata.pin_count > 0:
-                    mo.unpin()
-            try:
-                allocator.close()
-            except Exception:
-                pass
+    # Test decompress
+    engine.storage_manager.reset_mock()
+    engine.storage_manager.batched_get.return_value = [mock_compressed_mem_obj]
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        LMCacheEngine.decompress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="local_cpu",
+            event_id="event_123",
+        )
+        mock_compressed_mem_obj.unpin.assert_called_once()

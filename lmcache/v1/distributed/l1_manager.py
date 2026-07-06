@@ -15,7 +15,14 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
-from lmcache.v1.distributed.memory_manager import L1MemoryManager
+from lmcache.v1.distributed.memory_manager import (
+    GDSL1MemoryManager,
+    L1ManagerProtocol,
+    L1MemoryManager,
+)
+from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
+    DevDaxL1MemoryManager,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -112,6 +119,20 @@ def _validate_extra_count(extra_count: int) -> int:
     return extra_count
 
 
+def _l1_usage_ratio_or_zero(target: "L1Manager | None") -> float:
+    """Return ``target.get_memory_usage()`` as a 0.0-1.0 ratio.
+
+    Returns 0.0 when ``target`` is None or ``total_bytes`` is zero so the
+    observable-gauge callback never raises during scrape.
+    """
+    if target is None:
+        return 0.0
+    used, total = target.get_memory_usage()
+    if total <= 0:
+        return 0.0
+    return used / total
+
+
 # Main classes
 
 
@@ -170,7 +191,17 @@ class L1Manager:
 
         self._objects: dict[ObjectKey, L1ObjectState] = {}
 
-        self._memory_manager = L1MemoryManager(config.memory_config)
+        # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
+        # owns its backing allocator instead of branching inside the CPU path.
+        self._memory_manager: L1ManagerProtocol
+        if config.gds_l1_config is not None:
+            self._memory_manager = GDSL1MemoryManager(config.gds_l1_config)
+            logger.info("L1Manager: GDS L1 tier enabled; CPU pinned-DRAM L1 disabled")
+        elif config.memory_config.devdax_path:
+            self._memory_manager = DevDaxL1MemoryManager(config.memory_config)
+            logger.info("L1Manager: Device-DAX L1 tier enabled; CPU-only L1 disabled")
+        else:
+            self._memory_manager = L1MemoryManager(config.memory_config)
 
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
@@ -191,6 +222,12 @@ class L1Manager:
                     if L1Manager._gauge_target is not None
                     else 0
                 ),
+            )
+            register_gauge(
+                "lmcache.l1_manager",
+                "lmcache_mp.l1_usage_ratio",
+                "L1 used/total ratio (0.0–1.0)",
+                lambda: _l1_usage_ratio_or_zero(L1Manager._gauge_target),
             )
 
     def register_listener(self, listener: L1ManagerListener) -> None:
